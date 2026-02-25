@@ -30,6 +30,9 @@ packaging/docker/workspace/
 # OS
 .DS_Store
 
+# Claude Code
+.claude/
+
 # OpenCode mirror
 vendor/opencode/
 
