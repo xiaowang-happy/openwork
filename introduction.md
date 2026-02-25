@@ -115,6 +115,85 @@ compactSession(client, sessionID, model, options)  【压缩会话】
 │   └── client.session.command({ command: "compact" })  【回退到命令】
 ```
 
+### L1.5: Agent 层 (Agent Layer)
+
+```
+listAgents()  【获取 Agent 列表】
+│   │  获取当前工作区可用的 Agent 列表
+│   │
+│   ├── client()  【获取客户端】
+│   │       获取 OpenCode 客户端实例
+│   │
+│   ├── client.app.agents()  【调用 Agent 列表 API】
+│   │       从 OpenCode 获取 Agent 列表
+│   │
+│   └── unwrap()  【处理响应】
+│           解析响应，过滤隐藏的 Agent
+│
+│
+loadAgentOptions(force)  【加载 Agent 选项】
+│   │  加载 Agent 列表供 UI 选择器使用
+│   │
+│   ├── listAgents()  【获取 Agent 列表】
+│   │
+│   └── sort(agents)  【排序】
+│           按名称字母顺序排序
+│
+│
+setSessionAgent(sessionID, agent)  【设置会话 Agent】
+│   │  为指定会话设置使用的 Agent
+│   │
+│   └── setSessionAgentById()  【更新状态】
+│           更新全局状态中的会话 Agent
+│
+│
+buildPromptParts(draft)  【构建提示 Parts】
+│   │  构建发送给 LLM 的消息 parts
+│   │
+│   ├── [遍历 draft.parts]
+│   │   │
+│   │   ├── if type === "agent"  【Agent 引用】
+│   │   │   └── { type: "agent", name: part.name }  【添加 Agent Part】
+│   │   │
+│   │   └── if type === "file"  【文件引用】
+│   │       └── { type: "file", url: file://... }  【添加文件 Part】
+│   │
+│   └── [处理 attachments]  【附件处理】
+│           将附件转换为 file parts
+│
+│
+sendPrompt(draft)  【发送提示】
+│   │  发送用户输入到会话
+│   │
+│   ├── buildPromptParts(draft)  【构建 Parts】
+│   │       将用户输入转换为 SDK 格式
+│   │
+│   ├── selectedSessionAgent()  【获取会话 Agent】
+│   │       获取当前会话选定的 Agent
+│   │
+│   ├── if mode === "shell"  【Shell 模式】
+│   │   └── shellInSession(c, sessionID, content)
+│   │
+│   ├── if command  【命令模式】
+│   │   └── client.session.command({ sessionID, command, agent, ... })
+│   │
+│   └── else  【普通提示模式】
+│       └── client.session.promptAsync({ sessionID, model, agent, parts })
+│
+│
+Agent 文件结构 (.opencode/agent/*.md)
+│   │
+│   ├── ---  【YAML Frontmatter】
+│   │   ├── mode: primary | subagent
+│   │   ├── hidden: true | false
+│   │   ├── model: opencode/xxx
+│   │   ├── color: "#xxx"
+│   │   └── tools: { "*": false, "tool-name": true }
+│   │
+│   └── ##  【Markdown 描述】
+│       └── Agent 的系统提示和行为规范
+```
+
 ### L2: Server 路由层 (Server Routing Layer)
 
 ```
@@ -392,8 +471,329 @@ OpenWork UI 是 SolidJS 前端，提供：
 - **上下文面板**: 文件浏览、Artifacts
 - **技能市场**: Skill 安装和管理
 - **设置面板**: 模型、Provider、认证配置
+- **Agent 选择**: 支持 @agent 提及和 Agent 切换
 
-## 七、与 OpenCode 的关系
+## 七、Agent 架构详解
+
+### Agent 定义
+
+Agent 是 OpenCode 中的可配置 AI 行为模式，通过 `.opencode/agent/` 目录下的 Markdown 文件定义。
+
+### Agent 文件格式
+
+```yaml
+---
+mode: primary              # primary | subagent - 主 Agent 或子 Agent
+hidden: true              # 是否在 UI 中隐藏
+model: opencode/claude-haiku-4-5  # 使用的模型
+color: "#44BA81"          # UI 显示颜色
+tools:                   # 工具权限配置
+  "*": false              # 禁用所有工具
+  "github-triage": true   # 仅启用指定工具
+---
+
+# Agent 描述（Markdown 格式）
+You are a triage agent responsible for triaging github issues.
+...
+```
+
+### Agent 使用流程
+
+```
+用户在 Composer 中输入 @agentname
+        │
+        ▼
+Composer 识别 @ 触发 mention
+        │
+        ▼
+agentPicker 显示 Agent 列表（loadAgentOptions）
+        │
+        ▼
+用户选择 Agent
+        │
+        ▼
+part.type = "agent", part.name = "agentname"
+        │
+        ▼
+sendPrompt() 构建 parts
+        │
+        ▼
+buildPromptParts() 转换为 AgentPartInput
+        │
+        ▼
+client.session.promptAsync({ agent: "agentname", ... })
+        │
+        ▼
+OpenCode Server 处理 Agent 执行
+```
+
+### Agent 选择器状态管理
+
+```typescript
+// 状态定义
+agentOptions: Agent[]        // 可用 Agent 列表
+agentPickerOpen: boolean     // 选择器是否打开
+agentPickerBusy: boolean     // 加载中状态
+agentPickerError: string    // 错误信息
+selectedSessionAgent: string // 当前会话选定的 Agent
+
+// 选择器触发
+// 1. 用户输入 @ 字符
+// 2. 检测 mentionQuery 变化
+// 3. 打开 mentionGroups 弹窗
+// 4. 显示 category="agent" 的选项
+
+// Agent 过滤逻辑
+// - 隐藏 hidden: true 的 Agent
+// - 排除 mode: "subagent" 的 Agent
+// - 按名称字母排序
+```
+
+### Agent 与 Session 的关联
+
+每个 Session 可以关联不同的 Agent：
+
+```typescript
+// 设置会话 Agent
+setSessionAgent(sessionID, agentName)
+
+// 获取会话 Agent
+selectedSessionAgent()  // 返回当前会话的 Agent 名称
+
+// 在 promptAsync 中传递
+client.session.promptAsync({
+  sessionID,
+  model,
+  agent: agent ?? undefined,  // 可选的 Agent 参数
+  parts
+})
+```
+
+### 现有 Agent 示例
+
+OpenWork 项目中定义的 Agent（位于 `.opencode/agent/`）：
+
+| Agent 名称 | 用途 | 工具 |
+|-----------|------|------|
+| triage | GitHub Issue 分类 | github-triage |
+| docs | 文档相关任务 | - |
+| css | CSS 相关任务 | - |
+| duplicate-pr | 重复 PR 检测 | - |
+
+## 八、Skill 架构详解
+
+### Skill 定义
+
+Skill 是 OpenCode 中的可复用行为模式，通过 `.opencode/skills/` 目录下的 Markdown 文件定义。
+
+### Skill 文件结构
+
+```
+.opencode/skills/<skill-name>/
+└── SKILL.md          # Skill 定义文件
+```
+
+### Skill 文件格式
+
+```yaml
+---
+name: skill-name      # Skill 名称
+description: 描述    # Skill 描述
+trigger: 使用条件    # 触发条件（可选）
+---
+
+# When to use
+- 使用场景描述
+
+# Skill 描述
+你是一个...
+```
+
+### Skill 类型
+
+| 类型 | 路径 | 说明 |
+|------|------|------|
+| Project Skills | `.opencode/skills/` | 项目级 Skill |
+| Global Skills | `~/.config/opencode/skills` | 全局 Skill |
+| Claude Skills | `.claude/skills/` | 兼容 Claude 的 Skill |
+| Hub Skills | GitHub 不同AI/openwork-hub | 远程 Skill 市场 |
+
+### Skill 核心函数
+
+```
+listSkills(workspaceRoot, includeGlobal)  【列出 Skills】
+│   │  获取工作区的 Skill 列表
+│   │
+│   ├── findWorkspaceRoots()  【查找工作区根目录】
+│   │       向上遍历找到所有 Git 根目录
+│   │
+│   ├── listSkillsInDir(dir, scope)  【列出目录中的 Skills】
+│   │       │  扫描目录下的 Skill 文件夹
+│   │       │
+│   │       ├── parseSkillEntry()  【解析 Skill 项】
+│   │       │       读取 SKILL.md，解析 Frontmatter
+│   │       │
+│   │       └── extractTriggerFromBody()  【提取触发条件】
+│   │               从 Markdown 标题 "When to use" 提取
+│   │
+│   └── [合并全局 Skills]  【includeGlobal 时】
+│           添加 ~/.config/opencode/skills
+│
+│
+upsertSkill(workspaceRoot, payload)  【创建/更新 Skill】
+│   │  创建或更新 Skill
+│   │
+│   ├── validateSkillName()  【验证名称】
+│   │
+│   ├── parseFrontmatter(content)  【解析 Frontmatter】
+│   │
+│   ├── buildFrontmatter()  【构建 Frontmatter】
+│   │
+│   └── writeFile()  【写入文件】
+│           写入 .opencode/skills/<name>/SKILL.md
+│
+│
+deleteSkill(workspaceRoot, name)  【删除 Skill】
+│   │  删除指定 Skill
+│   │
+│   └── rm(skillDir, { recursive: true })  【删除目录】
+│
+│
+listHubSkills(repo)  【列出 Hub Skills】
+│   │  从 GitHub 获取远程 Skill 目录
+│   │
+│   ├── fetchJson()  【获取目录列表】
+│   │       GET https://api.github.com/repos/different-ai/openwork-hub/contents/skills
+│   │
+│   └── fetchText()  【获取 Skill 内容】
+│           获取每个 Skill 的详细信息
+```
+
+### Skill UI 流程
+
+```
+用户打开 Skills 页面
+        │
+        ▼
+refreshSkills()  加载 Skills
+        │
+        ├── client.workspace.skills.list()  【获取本地 Skills】
+        │
+        └── refreshHubSkills()  【获取 Hub Skills】
+                │
+                └── fetch GitHub API  【远程获取】
+                        │
+                        └── listHubSkills()  【缓存 5 分钟】
+        │
+        ▼
+显示 Skill 列表（skills(), hubSkills()）
+        │
+        ├── 点击 Skill → 查看详情
+        │
+        ├── 安装 Hub Skill → installHubSkill()
+        │       └── POST /workspace/:id/skills
+        │
+        └── 删除 Skill → uninstallSkill()
+                └── DELETE /workspace/:id/skills/:name
+```
+
+### Skill 与命令的关系
+
+在 Composer 的 slash 命令中显示为 `source: "skill"`：
+
+```typescript
+// composer.tsx 中的命令加载
+cmd.source === "skill"  // 显示 "Skill" 标签
+```
+
+## 九、MCP Tool 架构详解
+
+### MCP 定义
+
+MCP (Model Context Protocol) 是开放协议，允许 AI 助手连接到外部工具和服务。
+
+### MCP 配置
+
+MCP 通过 `opencode.jsonc` 配置文件定义：
+
+```jsonc
+{
+  "mcp": {
+    "server-name": {
+      "command": "npx",
+      "args": ["-y", "@example/mcp-server"]
+    }
+  }
+}
+```
+
+### MCP 核心函数
+
+```
+listMcp(workspaceRoot)  【列出 MCP 服务器】
+│   │  获取工作区配置的 MCP 服务器列表
+│   │
+│   ├── readJsoncFile(opencodeConfigPath)  【读取项目配置】
+│   │       读取 .opencode/opencode.jsonc
+│   │
+│   ├── readJsoncFile(globalOpenCodeConfigPath)  【读取全局配置】
+│   │       读取 ~/.config/opencode/opencode.jsonc
+│   │
+│   ├── getMcpConfig(config)  【提取 MCP 配置】
+│   │       从配置中提取 mcp 字段
+│   │
+│   └── isMcpDisabledByTools(config, name)  【检查是否被禁用】
+│           检查 tools.deny 模式
+│
+│
+addMcp(workspaceRoot, name, config)  【添加 MCP 服务器】
+│   │  添加新的 MCP 服务器配置
+│   │
+│   ├── validateMcpName()  【验证名称】
+│   │
+│   ├── validateMcpConfig()  【验证配置】
+│   │
+│   └── updateJsoncTopLevel()  【更新配置】
+│           更新 opencode.jsonc 的 mcp 字段
+│
+│
+removeMcp(workspaceRoot, name)  【移除 MCP 服务器】
+│   │  移除 MCP 服务器配置
+│   │
+│   └── updateJsoncTopLevel()  【更新配置】
+│           删除 mcp 字段中的对应项
+```
+
+### MCP 路由
+
+```
+GET    /workspace/:id/mcp           # 获取 MCP 列表
+POST   /workspace/:id/mcp           # 添加 MCP
+DELETE /workspace/:id/mcp/:name     # 删除 MCP
+```
+
+### MCP 状态管理
+
+```
+MCP 状态类型：
+- connected      # 已连接
+- needs_auth     # 需要认证
+- needs_client_registration  # 需要客户端注册
+- failed         # 失败
+- disabled       # 已禁用
+- disconnected   # 已断开
+```
+
+### MCP 与命令的关系
+
+在 Composer 的 slash 命令中显示为 `source: "mcp"`：
+
+```typescript
+// composer.tsx 中的命令加载
+cmd.source === "mcp"  // 显示 "MCP" 标签
+```
+
+## 十、与 OpenCode 的关系
 
 OpenWork 与 OpenCode 的核心区别：
 
@@ -413,7 +813,7 @@ OpenWork 本质上是 **OpenCode 的包装层**，在 OpenCode 基础上增加�
 4. 编排器（Orchestrator）
 5. 消息集成（OpenCodeRouter）
 
-## 八、API 路由速查
+## 十一、API 路由速查
 
 ### Workspace 路由
 
